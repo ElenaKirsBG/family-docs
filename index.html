@@ -382,8 +382,32 @@
         const file = files[0];
         const reader = new FileReader();
         reader.onload = (evt) => {
-          setCropperTargetScanId(scanIdToReplace);
-          setCropperSrc(evt.target.result);
+          // Оптимизация и сжатие снимка с камеры перед отправкой в редактор
+          const img = new Image();
+          img.onload = () => {
+            const canvas = document.createElement('canvas');
+            let w = img.width;
+            let h = img.height;
+            const maxDim = 1600; // Оптимальный размер для скана документа
+            if (w > maxDim || h > maxDim) {
+              if (w > h) {
+                h = Math.round((h * maxDim) / w);
+                w = maxDim;
+              } else {
+                w = Math.round((w * maxDim) / h);
+                h = maxDim;
+              }
+            }
+            canvas.width = w;
+            canvas.height = h;
+            const ctx = canvas.getContext('2d');
+            ctx.drawImage(img, 0, 0, w, h);
+            const optimizedBase64 = canvas.toDataURL('image/jpeg', 0.8);
+            
+            setCropperTargetScanId(scanIdToReplace);
+            setCropperSrc(optimizedBase64);
+          };
+          img.src = evt.target.result;
         };
         reader.readAsDataURL(file);
         e.target.value = '';
