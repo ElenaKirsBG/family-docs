@@ -1,0 +1,1268 @@
+import React, { useState, useEffect, useRef } from 'react';
+import { 
+  ShieldCheck, UserPlus, Users, Plus, Copy, Check, Download, Upload, 
+  Trash2, Edit3, Camera, RotateCw, Crop, Sun, Sliders, FileText, 
+  Search, Calendar, AlertTriangle, ArrowRight, X, ChevronRight, Eye, 
+  Lock, Key, FileImage, ShieldAlert, Sparkles, RefreshCw
+} from 'lucide-react';
+
+// --- INDEXED DB STORAGE ENGINE ---
+const DB_NAME = 'FamilyVaultDB';
+const DB_VERSION = 1;
+
+const initDB = () => {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open(DB_NAME, DB_VERSION);
+    request.onerror = () => reject('Failed to open database');
+    request.onsuccess = () => resolve(request.result);
+    request.onupgradeneeded = (e) => {
+      const db = e.target.result;
+      if (!db.objectStoreNames.contains('members')) {
+        db.createObjectStore('members', { keyPath: 'id' });
+      }
+      if (!db.objectStoreNames.contains('documents')) {
+        db.createObjectStore('documents', { keyPath: 'id' });
+      }
+    };
+  });
+};
+
+const dbOp = async (storeName, mode, callback) => {
+  const db = await initDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(storeName, mode);
+    const store = tx.objectStore(storeName);
+    const request = callback(store);
+    tx.oncomplete = () => resolve(request ? request.result : true);
+    tx.onerror = () => reject(tx.error);
+  });
+};
+
+// --- WEBCRYPTO ENCRYPTION HELPERS FOR BACKUPS ---
+async function getKey(password, salt) {
+  const enc = new TextEncoder();
+  const keyMaterial = await window.crypto.subtle.importKey(
+    "raw", enc.encode(password), { name: "PBKDF2" }, false, ["deriveKey"]
+  );
+  return window.crypto.subtle.deriveKey(
+    {
+      name: "PBKDF2",
+      salt: salt,
+      iterations: 100000,
+      hash: "SHA-256"
+    },
+    keyMaterial,
+    { name: "AES-GCM", length: 256 },
+    false,
+    ["encrypt", "decrypt"]
+  );
+}
+
+async function encryptData(dataString, password) {
+  const enc = new TextEncoder();
+  const salt = window.crypto.getRandomValues(new Uint8Array(16));
+  const iv = window.crypto.getRandomValues(new Uint8Array(12));
+  const key = await getKey(password, salt);
+  const encrypted = await window.crypto.subtle.encrypt(
+    { name: "AES-GCM", iv: iv },
+    key,
+    enc.encode(dataString)
+  );
+  
+  const combined = new Uint8Array(salt.length + iv.length + encrypted.byteLength);
+  combined.set(salt, 0);
+  combined.set(iv, salt.length);
+  combined.set(new Uint8Array(encrypted), salt.length + iv.length);
+  
+  return btoa(String.fromCharCode.apply(null, combined));
+}
+
+async function decryptData(encryptedBase64, password) {
+  try {
+    const combinedStr = atob(encryptedBase64);
+    const combined = new Uint8Array(combinedStr.length);
+    for (let i = 0; i < combinedStr.length; i++) combined[i] = combinedStr.charCodeAt(i);
+    
+    const salt = combined.slice(0, 16);
+    const iv = combined.slice(16, 28);
+    const data = combined.slice(28);
+    
+    const key = await getKey(password, salt);
+    const decrypted = await window.crypto.subtle.decrypt(
+      { name: "AES-GCM", iv: iv },
+      key,
+      data
+    );
+    return new TextDecoder().decode(decrypted);
+  } catch (err) {
+    throw new Error('Неверный пароль или поврежденные данные');
+  }
+}
+
+// --- DOCUMENT TEMPLATES CONFIG ---
+const DOC_TEMPLATES = {
+  passport_rf: {
+    name: 'Российский паспорт',
+    category: 'Паспорта',
+    icon: '🪪',
+    fields: [
+      { id: 'series_num', label: 'Серия и Номер', placeholder: '1234 567890', req: true },
+      { id: 'issue_date', label: 'Дата выдачи', type: 'date' },
+      { id: 'issuer_code', label: 'Код подразделения', placeholder: '770-001' },
+      { id: 'issuer', label: 'Кем выдан', placeholder: 'ГУ МВД по г. Москве' },
+      { id: 'birth_place', label: 'Место рождения' },
+      { id: 'registration', label: 'Адрес регистрации' }
+    ]
+  },
+  passport_zagran: {
+    name: 'Заграничный паспорт',
+    category: 'Паспорта',
+    icon: '✈️',
+    fields: [
+      { id: 'number', label: 'Серия и Номер', placeholder: '75 1234567', req: true },
+      { id: 'latin_name', label: 'ФИО (Латиницей)', placeholder: 'IVANOV IVAN' },
+      { id: 'issue_date', label: 'Дата выдачи', type: 'date' },
+      { id: 'expiry_date', label: 'Срок действия', type: 'date' },
+      { id: 'issuer', label: 'Орган выдачи', placeholder: 'МВД 77001' }
+    ]
+  },
+  snils: {
+    name: 'СНИЛС',
+    category: 'Личные',
+    icon: '💚',
+    fields: [
+      { id: 'number', label: 'Номер СНИЛС', placeholder: '123-456-789 00', req: true }
+    ]
+  },
+  inn: {
+    name: 'ИНН',
+    category: 'Личные',
+    icon: '📋',
+    fields: [
+      { id: 'number', label: 'Номер ИНН', placeholder: '771234567890', req: true }
+    ]
+  },
+  driver_rf: {
+    name: 'Водительское удостоверение (РФ)',
+    category: 'Транспорт',
+    icon: '🚗',
+    fields: [
+      { id: 'number', label: 'Серия и Номер', placeholder: '99 12 345678', req: true },
+      { id: 'categories', label: 'Категории', placeholder: 'B, B1, M' },
+      { id: 'issue_date', label: 'Дата выдачи', type: 'date' },
+      { id: 'expiry_date', label: 'Действителен до', type: 'date' }
+    ]
+  },
+  driver_int: {
+    name: 'Международное в/у (IDP)',
+    category: 'Транспорт',
+    icon: '🌍',
+    fields: [
+      { id: 'number', label: 'Номер МВУ', placeholder: '99 00 123456', req: true },
+      { id: 'issue_date', label: 'Дата выдачи', type: 'date' },
+      { id: 'expiry_date', label: 'Действителен до', type: 'date' }
+    ]
+  },
+  marriage_cert: {
+    name: 'Свидетельство о браке',
+    category: 'Семья',
+    icon: '💍',
+    fields: [
+      { id: 'act_num', label: 'Номер записи акта', placeholder: '12345' },
+      { id: 'blank_num', label: 'Серия и номер бланка', placeholder: 'I-МЮ № 654321' },
+      { id: 'date', label: 'Дата заключения брака', type: 'date' },
+      { id: 'spouse_name', label: 'ФИО Супруга(и)' }
+    ]
+  },
+  birth_cert: {
+    name: 'Свидетельство о рождении ребенка',
+    category: 'Семья',
+    icon: '👶',
+    fields: [
+      { id: 'act_num', label: 'Номер записи акта', placeholder: '789' },
+      { id: 'blank_num', label: 'Серия и номер бланка', placeholder: 'II-МЮ № 123456' },
+      { id: 'child_name', label: 'ФИО Ребенка', placeholder: 'Иванов Александр Алексеевич' },
+      { id: 'birth_date', label: 'Дата рождения', type: 'date' }
+    ]
+  },
+  custom: {
+    name: 'Другой документ',
+    category: 'Прочее',
+    icon: '📂',
+    fields: [
+      { id: 'doc_num', label: 'Номер / Реквизит', placeholder: '№ документа' },
+      { id: 'note', label: 'Примечание / Описание' }
+    ]
+  }
+};
+
+const DEFAULT_MEMBERS = [
+  { id: 'm_1', name: 'Я (Основной)', role: 'Владелец', color: 'from-blue-600 to-indigo-600' },
+  { id: 'm_2', name: 'Супруг(а)', role: 'Семья', color: 'from-rose-500 to-pink-600' }
+];
+
+export default function App() {
+  // --- STATES ---
+  const [members, setMembers] = useState([]);
+  const [documents, setDocuments] = useState([]);
+  const [activeMemberId, setActiveMemberId] = useState(null);
+  const [searchQuery, setSearchQuery] = useState('');
+  const [selectedCategory, setSelectedCategory] = useState('Все');
+  
+  // Modals
+  const [isMemberModalOpen, setIsMemberModalOpen] = useState(false);
+  const [editingMember, setEditingMember] = useState(null);
+  const [isDocModalOpen, setIsDocModalOpen] = useState(false);
+  const [editingDoc, setEditingDoc] = useState(null);
+  const [isBackupModalOpen, setIsBackupModalOpen] = useState(false);
+  
+  // Scans & Cropper
+  const [cropperSrc, setCropperSrc] = useState(null);
+  const [tempScans, setTempScans] = useState([]);
+  const [viewerScan, setViewerScan] = useState(null);
+  const [toastMsg, setToastMsg] = useState(null);
+
+  // Load Initial Data from IndexedDB
+  useEffect(() => {
+    loadDatabase();
+  }, []);
+
+  const loadDatabase = async () => {
+    try {
+      let storedMembers = await dbOp('members', 'readonly', s => s.getAll());
+      if (!storedMembers || storedMembers.length === 0) {
+        // Seed Defaults
+        for (const m of DEFAULT_MEMBERS) {
+          await dbOp('members', 'readwrite', s => s.put(m));
+        }
+        storedMembers = DEFAULT_MEMBERS;
+      }
+      setMembers(storedMembers);
+      if (!activeMemberId && storedMembers.length > 0) {
+        setActiveMemberId(storedMembers[0].id);
+      }
+
+      const storedDocs = await dbOp('documents', 'readonly', s => s.getAll());
+      setDocuments(storedDocs || []);
+    } catch (err) {
+      console.error("DB Load Error:", err);
+      showToast("Ошибка работы базы данных", "error");
+    }
+  };
+
+  const showToast = (message, type = 'info') => {
+    setToastMsg({ message, type });
+    setTimeout(() => setToastMsg(null), 3000);
+  };
+
+  const copyToClipboard = (text) => {
+    if (!text) return;
+    navigator.clipboard.writeText(text);
+    showToast(`Скопировано: ${text}`, 'success');
+  };
+
+  // --- MEMBER HANDLERS ---
+  const handleSaveMember = async (e) => {
+    e.preventDefault();
+    const formData = new FormData(e.target);
+    const memberObj = {
+      id: editingMember?.id || `m_${Date.now()}`,
+      name: formData.get('name'),
+      role: formData.get('role'),
+      color: formData.get('color') || 'from-blue-600 to-indigo-600'
+    };
+
+    await dbOp('members', 'readwrite', s => s.put(memberObj));
+    await loadDatabase();
+    setIsMemberModalOpen(false);
+    setEditingMember(null);
+    showToast('Профиль сохранен');
+  };
+
+  const handleDeleteMember = async (id) => {
+    if (members.length <= 1) {
+      showToast('Нельзя удалить последний профиль!', 'error');
+      return;
+    }
+    if (confirm('Вы уверены? Документы этого члена семьи также будут удалены.')) {
+      await dbOp('members', 'readwrite', s => s.delete(id));
+      // Delete user docs
+      const userDocs = documents.filter(d => d.memberId === id);
+      for (const d of userDocs) {
+        await dbOp('documents', 'readwrite', s => s.delete(d.id));
+      }
+      setActiveMemberId(members.find(m => m.id !== id).id);
+      await loadDatabase();
+      setIsMemberModalOpen(false);
+      showToast('Профиль удален');
+    }
+  };
+
+  // --- DOCUMENT HANDLERS ---
+  const handleOpenNewDoc = () => {
+    setEditingDoc(null);
+    setTempScans([]);
+    setIsDocModalOpen(true);
+  };
+
+  const handleOpenEditDoc = (docItem) => {
+    setEditingDoc(docItem);
+    setTempScans(docItem.scans || []);
+    setIsDocModalOpen(true);
+  };
+
+  const handleSaveDoc = async (e) => {
+    e.preventDefault();
+    const form = e.target;
+    const typeKey = form.elements['doc_type'].value;
+    const tmpl = DOC_TEMPLATES[typeKey];
+
+    const fields = {};
+    if (tmpl && tmpl.fields) {
+      tmpl.fields.forEach(f => {
+        fields[f.id] = form.elements[`field_${f.id}`]?.value || '';
+      });
+    }
+
+    const docObj = {
+      id: editingDoc?.id || `doc_${Date.now()}`,
+      memberId: activeMemberId,
+      type: typeKey,
+      customTitle: form.elements['custom_title']?.value || '',
+      fields,
+      scans: tempScans,
+      expiryDate: form.elements['expiry_date']?.value || '',
+      hasExpiry: form.elements['has_expiry']?.checked || false,
+      updatedAt: new Date().toISOString()
+    };
+
+    await dbOp('documents', 'readwrite', s => s.put(docObj));
+    await loadDatabase();
+    setIsDocModalOpen(false);
+    showToast('Документ успешно сохранен!');
+  };
+
+  const handleDeleteDoc = async (id) => {
+    if (confirm('Удалить этот документ безвозвратно?')) {
+      await dbOp('documents', 'readwrite', s => s.delete(id));
+      await loadDatabase();
+      setIsDocModalOpen(false);
+      showToast('Документ удален');
+    }
+  };
+
+  // Handle Photo Import & Camera Capture
+  const handleFileSelect = (e) => {
+    const files = Array.from(e.target.files);
+    if (!files.length) return;
+    const file = files[0];
+    const reader = new FileReader();
+    reader.onload = (evt) => {
+      setCropperSrc(evt.target.result);
+    };
+    reader.readAsDataURL(file);
+    e.target.value = '';
+  };
+
+  const handleSaveCrop = (croppedBase64) => {
+    setTempScans(prev => [...prev, {
+      id: `scan_${Date.now()}_${Math.random().toString(36).substr(2,4)}`,
+      data: croppedBase64
+    }]);
+    setCropperSrc(null);
+    showToast('Скан обрезан и добавлен');
+  };
+
+  // --- BACKUP EXPORT & IMPORT (AES ENCRYPTED OPTION) ---
+  const handleExportBackup = async (password) => {
+    try {
+      const allMembers = await dbOp('members', 'readonly', s => s.getAll());
+      const allDocs = await dbOp('documents', 'readonly', s => s.getAll());
+
+      const backupData = {
+        version: 1,
+        createdAt: new Date().toISOString(),
+        members: allMembers,
+        documents: allDocs
+      };
+
+      const rawJson = JSON.stringify(backupData);
+      let fileContent = rawJson;
+      let fileName = `family_vault_backup_${new Date().toISOString().slice(0,10)}.json`;
+
+      if (password && password.trim()) {
+        fileContent = await encryptData(rawJson, password.trim());
+        fileName = `encrypted_${fileName}`;
+      }
+
+      const blob = new Blob([fileContent], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = fileName;
+      a.click();
+      URL.revokeObjectURL(url);
+
+      showToast('Резервная копия скачана!', 'success');
+      setIsBackupModalOpen(false);
+    } catch (err) {
+      console.error(err);
+      showToast('Ошибка при экспорте', 'error');
+    }
+  };
+
+  const handleImportBackup = async (file, password) => {
+    try {
+      const text = await file.text();
+      let jsonStr = text;
+
+      // Try decrypting if password provided or text doesn't look like JSON
+      if (!text.trim().startsWith('{')) {
+        if (!password) {
+          showToast('Этот бэкап зашифрован. Введите пароль!', 'error');
+          return;
+        }
+        jsonStr = await decryptData(text, password);
+      }
+
+      const parsed = JSON.parse(jsonStr);
+      if (!parsed.members || !parsed.documents) {
+        throw new Error('Некорректный формат резервной копии');
+      }
+
+      if (confirm('Импортировать данные? Текущие записи будут объединены с новыми.')) {
+        for (const m of parsed.members) {
+          await dbOp('members', 'readwrite', s => s.put(m));
+        }
+        for (const d of parsed.documents) {
+          await dbOp('documents', 'readwrite', s => s.put(d));
+        }
+        await loadDatabase();
+        showToast('Данные успешно импортированы!');
+        setIsBackupModalOpen(false);
+      }
+    } catch (err) {
+      console.error(err);
+      showToast(err.message || 'Ошибка импорта бэкапа', 'error');
+    }
+  };
+
+  // --- COMPUTED DATA ---
+  const activeMember = members.find(m => m.id === activeMemberId) || members[0];
+  const categories = ['Все', 'Паспорта', 'Личные', 'Транспорт', 'Семья', 'Прочее'];
+
+  const filteredDocs = documents.filter(d => {
+    if (d.memberId !== activeMemberId) return false;
+    const tmpl = DOC_TEMPLATES[d.type] || DOC_TEMPLATES.custom;
+    if (selectedCategory !== 'Все' && tmpl.category !== selectedCategory) return false;
+    if (searchQuery.trim()) {
+      const q = searchQuery.toLowerCase();
+      const matchName = tmpl.name.toLowerCase().includes(q) || (d.customTitle && d.customTitle.toLowerCase().includes(q));
+      const matchFields = Object.values(d.fields || {}).some(v => String(v).toLowerCase().includes(q));
+      return matchName || matchFields;
+    }
+    return true;
+  });
+
+  return (
+    <div className="flex flex-col md:flex-row h-screen w-screen bg-slate-950 text-slate-100 font-sans overflow-hidden selection:bg-blue-600 selection:text-white">
+      
+      {/* TOAST NOTIFICATION */}
+      {toastMsg && (
+        <div className={`fixed top-4 right-4 z-50 px-4 py-3 rounded-2xl shadow-2xl flex items-center gap-3 border text-sm font-medium transition duration-300 ${
+          toastMsg.type === 'error' ? 'bg-rose-950/90 border-rose-700 text-rose-200' : 'bg-slate-900/90 border-blue-500/40 text-blue-200 backdrop-blur-md'
+        }`}>
+          {toastMsg.type === 'error' ? <ShieldAlert className="w-5 h-5 text-rose-400" /> : <Sparkles className="w-5 h-5 text-blue-400" />}
+          <span>{toastMsg.message}</span>
+        </div>
+      )}
+
+      {/* --- SIDEBAR: FAMILY MEMBERS --- */}
+      <aside className="w-full md:w-72 lg:w-80 bg-slate-900/60 border-r border-slate-800/80 flex flex-col shrink-0">
+        
+        {/* Header Branding */}
+        <div className="p-4 border-b border-slate-800/80 flex items-center justify-between">
+          <div className="flex items-center gap-3">
+            <div className="w-10 h-10 rounded-2xl bg-gradient-to-tr from-blue-600 to-indigo-600 flex items-center justify-center text-white shadow-lg shadow-blue-500/20">
+              <ShieldCheck className="w-6 h-6" />
+            </div>
+            <div>
+              <h1 className="font-bold text-slate-100 text-base leading-tight">Семейный Архив</h1>
+              <span className="text-[10px] text-emerald-400 font-medium flex items-center gap-1">
+                <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span> 100% Локально
+              </span>
+            </div>
+          </div>
+          
+          <button 
+            onClick={() => setIsBackupModalOpen(true)}
+            title="Резервная копия и обмен" 
+            className="p-2 text-slate-400 hover:text-white hover:bg-slate-800 rounded-xl transition"
+          >
+            <Download className="w-5 h-5" />
+          </button>
+        </div>
+
+        {/* Member Selector List */}
+        <div className="p-3 flex-1 overflow-y-auto space-y-1">
+          <div className="flex justify-between items-center px-2 mb-2">
+            <span className="text-[11px] font-semibold uppercase tracking-wider text-slate-500">Члены семьи</span>
+            <button 
+              onClick={() => { setEditingMember(null); setIsMemberModalOpen(true); }}
+              className="text-xs text-blue-400 hover:text-blue-300 font-medium flex items-center gap-1"
+            >
+              <Plus className="w-3.5 h-3.5" /> Добавить
+            </button>
+          </div>
+
+          {members.map(m => {
+            const count = documents.filter(d => d.memberId === m.id).length;
+            const isActive = m.id === activeMemberId;
+            return (
+              <div 
+                key={m.id}
+                onClick={() => setActiveMemberId(m.id)}
+                className={`p-3 rounded-2xl flex items-center justify-between cursor-pointer transition ${
+                  isActive 
+                    ? 'bg-slate-800/90 text-white border border-slate-700/60 shadow-lg shadow-slate-950/40' 
+                    : 'text-slate-400 hover:bg-slate-800/40 hover:text-slate-200'
+                }`}
+              >
+                <div className="flex items-center gap-3 truncate">
+                  <div className={`w-9 h-9 rounded-xl bg-gradient-to-tr ${m.color || 'from-blue-600 to-indigo-600'} flex items-center justify-center font-bold text-white text-sm shadow-md`}>
+                    {m.name.charAt(0).toUpperCase()}
+                  </div>
+                  <div className="truncate">
+                    <div className="text-xs font-semibold text-slate-100 truncate">{m.name}</div>
+                    <div className="text-[10px] text-slate-400 truncate">{m.role || 'Член семьи'}</div>
+                  </div>
+                </div>
+                <span className={`text-[10px] px-2 py-0.5 rounded-full font-bold ${
+                  isActive ? 'bg-blue-500/20 text-blue-300' : 'bg-slate-800 text-slate-500'
+                }`}>
+                  {count}
+                </span>
+              </div>
+            );
+          })}
+        </div>
+
+        {/* Bottom Security Info Banner */}
+        <div className="p-3 border-t border-slate-800/80 bg-slate-950/60 text-[11px] text-slate-400 flex items-center justify-between">
+          <span className="flex items-center gap-1.5 text-slate-400">
+            <Lock className="w-3.5 h-3.5 text-blue-400" /> Без облаков и серверов
+          </span>
+          <span className="text-[10px] text-slate-500">IndexedDB</span>
+        </div>
+      </aside>
+
+      {/* --- MAIN AREA: DOCUMENTS VIEW --- */}
+      <main className="flex-1 flex flex-col h-full overflow-hidden bg-slate-950">
+        
+        {/* Top Action Bar */}
+        <header className="p-4 border-b border-slate-800/80 bg-slate-900/40 backdrop-blur-md flex flex-col sm:flex-row gap-3 justify-between items-center shrink-0">
+          
+          {/* Active Profile Info */}
+          <div className="flex items-center gap-3 w-full sm:w-auto justify-between sm:justify-start">
+            <div className="flex items-center gap-3">
+              <div className={`w-10 h-10 rounded-2xl bg-gradient-to-tr ${activeMember?.color || 'from-blue-600 to-indigo-600'} flex items-center justify-center font-bold text-white text-base shadow-md`}>
+                {activeMember?.name?.charAt(0).toUpperCase()}
+              </div>
+              <div>
+                <h2 className="text-base font-bold text-slate-100 leading-tight">{activeMember?.name}</h2>
+                <p className="text-xs text-slate-400">{activeMember?.role || 'Личный архив'}</p>
+              </div>
+            </div>
+
+            <button 
+              onClick={() => { setEditingMember(activeMember); setIsMemberModalOpen(true); }}
+              className="p-2 text-slate-400 hover:text-white hover:bg-slate-800 rounded-xl transition"
+              title="Настройки профиля"
+            >
+              <Edit3 className="w-4 h-4" />
+            </button>
+          </div>
+
+          {/* Controls: Search & Add Document Button */}
+          <div className="flex items-center gap-2 w-full sm:w-auto">
+            <div className="relative flex-1 sm:w-64">
+              <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-slate-500" />
+              <input 
+                type="text"
+                placeholder="Поиск по документам..."
+                value={searchQuery}
+                onChange={e => setSearchQuery(e.target.value)}
+                className="w-full pl-9 pr-3 py-2 bg-slate-900 border border-slate-800 rounded-xl text-xs text-slate-100 placeholder-slate-500 focus:outline-none focus:border-blue-500 transition"
+              />
+            </div>
+
+            <button 
+              onClick={handleOpenNewDoc}
+              className="px-4 py-2 bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 text-white rounded-xl text-xs font-semibold shadow-lg shadow-blue-600/20 flex items-center gap-2 transition whitespace-nowrap"
+            >
+              <Plus className="w-4 h-4" /> <span>Добавить документ</span>
+            </button>
+          </div>
+        </header>
+
+        {/* Content Body: Categories & Documents Grid */}
+        <div className="flex-1 p-4 md:p-6 overflow-y-auto space-y-4">
+          
+          {/* Category Pills */}
+          <div className="flex gap-2 overflow-x-auto pb-1 no-scrollbar text-xs font-medium">
+            {categories.map(cat => (
+              <button
+                key={cat}
+                onClick={() => setSelectedCategory(cat)}
+                className={`px-3.5 py-1.5 rounded-xl whitespace-nowrap transition border ${
+                  selectedCategory === cat 
+                    ? 'bg-blue-600 border-blue-500 text-white shadow-md' 
+                    : 'bg-slate-900 border-slate-800 text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                {cat}
+              </button>
+            ))}
+          </div>
+
+          {/* Documents Cards Grid */}
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+            {filteredDocs.map(docItem => {
+              const tmpl = DOC_TEMPLATES[docItem.type] || DOC_TEMPLATES.custom;
+              const docTitle = docItem.type === 'custom' ? docItem.customTitle || tmpl.name : tmpl.name;
+
+              // Check Expiry
+              let expiryBadge = null;
+              if (docItem.hasExpiry && docItem.expiryDate) {
+                const daysLeft = Math.ceil((new Date(docItem.expiryDate) - new Date()) / (1000 * 60 * 60 * 24));
+                if (daysLeft < 0) {
+                  expiryBadge = <span className="px-2 py-0.5 rounded-md text-[10px] font-bold bg-rose-500/10 text-rose-400 border border-rose-500/20">Просрочен</span>;
+                } else if (daysLeft <= 90) {
+                  expiryBadge = <span className="px-2 py-0.5 rounded-md text-[10px] font-bold bg-amber-500/10 text-amber-400 border border-amber-500/20">{daysLeft} дн.</span>;
+                } else {
+                  expiryBadge = <span className="px-2 py-0.5 rounded-md text-[10px] font-bold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">Действителен</span>;
+                }
+              }
+
+              return (
+                <div 
+                  key={docItem.id}
+                  className="bg-slate-900/60 border border-slate-800/80 rounded-2xl p-4 flex flex-col justify-between hover:border-slate-700 transition shadow-xl group"
+                >
+                  <div>
+                    {/* Card Header */}
+                    <div className="flex justify-between items-start mb-3">
+                      <div className="flex items-center gap-3">
+                        <div className="w-10 h-10 rounded-xl bg-slate-800 border border-slate-700/60 flex items-center justify-center text-xl shadow-inner">
+                          {tmpl.icon}
+                        </div>
+                        <div>
+                          <h3 className="font-bold text-slate-100 text-sm leading-snug">{docTitle}</h3>
+                          <span className="text-[10px] text-slate-500">{tmpl.category}</span>
+                        </div>
+                      </div>
+                      <div className="flex items-center gap-1">
+                        {expiryBadge}
+                        <button 
+                          onClick={() => handleOpenEditDoc(docItem)}
+                          className="p-1.5 text-slate-400 hover:text-white hover:bg-slate-800 rounded-lg transition"
+                        >
+                          <Edit3 className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
+                    </div>
+
+                    {/* Attribute Fields */}
+                    <div className="space-y-1 mt-3">
+                      {Object.entries(docItem.fields || {}).map(([key, val]) => {
+                        if (!val) return null;
+                        const fieldConfig = tmpl.fields?.find(f => f.id === key);
+                        const label = fieldConfig ? fieldConfig.label : key;
+
+                        return (
+                          <div key={key} className="flex justify-between items-center py-1 border-b border-slate-800/40 last:border-none group/field">
+                            <div className="truncate pr-2">
+                              <span className="text-[10px] text-slate-500 uppercase font-medium block">{label}</span>
+                              <span className="text-xs font-mono text-slate-200 font-medium truncate block">{val}</span>
+                            </div>
+                            <button 
+                              onClick={() => copyToClipboard(val)}
+                              className="p-1 text-slate-500 hover:text-blue-400 hover:bg-slate-800 rounded transition opacity-80 sm:opacity-0 group-hover/field:opacity-100"
+                              title="Копировать"
+                            >
+                              <Copy className="w-3.5 h-3.5" />
+                            </button>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+
+                  {/* Scans Thumbnails Footer */}
+                  {docItem.scans && docItem.scans.length > 0 && (
+                    <div className="mt-4 pt-3 border-t border-slate-800/60 flex items-center justify-between">
+                      <span className="text-[11px] text-slate-400 flex items-center gap-1">
+                        <FileImage className="w-3.5 h-3.5 text-slate-500" /> Сканов: {docItem.scans.length}
+                      </span>
+                      <div className="flex -space-x-2">
+                        {docItem.scans.slice(0, 3).map((scan, idx) => (
+                          <div 
+                            key={scan.id || idx}
+                            onClick={() => setViewerScan(scan.data)}
+                            className="w-8 h-8 rounded-lg border border-slate-700 bg-slate-800 overflow-hidden cursor-pointer hover:scale-110 transition shadow-md"
+                          >
+                            <img src={scan.data} alt="scan" className="w-full h-full object-cover" />
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+
+          {/* Empty State */}
+          {filteredDocs.length === 0 && (
+            <div className="flex flex-col items-center justify-center py-16 text-center">
+              <div className="w-16 h-16 rounded-2xl bg-slate-900 border border-slate-800 flex items-center justify-center text-slate-600 mb-3">
+                <FileText className="w-8 h-8" />
+              </div>
+              <h4 className="text-slate-300 font-semibold text-sm">Документы не найдены</h4>
+              <p className="text-slate-500 text-xs mt-1 max-w-xs">Добавьте первый документ или изменьте параметры поиска.</p>
+              <button 
+                onClick={handleOpenNewDoc}
+                className="mt-4 px-4 py-2 bg-slate-800 hover:bg-slate-700 text-blue-400 rounded-xl text-xs font-semibold transition"
+              >
+                + Добавить документ
+              </button>
+            </div>
+          )}
+        </div>
+      </main>
+
+      {/* --- CROPPER & SCAN EDITOR MODAL --- */}
+      {cropperSrc && (
+        <CropperModal 
+          imageSrc={cropperSrc} 
+          onCancel={() => setCropperSrc(null)}
+          onSave={handleSaveCrop}
+        />
+      )}
+
+      {/* --- SCAN IMAGE FULLSCREEN VIEWER --- */}
+      {viewerScan && (
+        <div className="fixed inset-0 z-50 bg-slate-950/90 backdrop-blur-md flex flex-col p-4">
+          <div className="flex justify-between items-center text-white mb-2">
+            <span className="text-xs font-medium text-slate-400">Просмотр скана</span>
+            <div className="flex gap-2">
+              <a 
+                href={viewerScan} 
+                download="document_scan.png"
+                className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 rounded-xl text-xs font-medium flex items-center gap-1.5"
+              >
+                <Download className="w-3.5 h-3.5" /> Скачать
+              </a>
+              <button 
+                onClick={() => setViewerScan(null)}
+                className="p-1.5 text-slate-400 hover:text-white bg-slate-800 rounded-xl"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+          </div>
+          <div className="flex-1 flex items-center justify-center overflow-hidden">
+            <img src={viewerScan} alt="scan full" className="max-h-full max-w-full object-contain rounded-xl shadow-2xl" />
+          </div>
+        </div>
+      )}
+
+      {/* --- MODAL: MEMBER EDIT --- */}
+      {isMemberModalOpen && (
+        <div className="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="bg-slate-900 border border-slate-800 rounded-3xl w-full max-w-sm p-6 shadow-2xl">
+            <div className="flex justify-between items-center mb-4">
+              <h3 className="font-bold text-slate-100 text-base">
+                {editingMember ? 'Редактировать профиль' : 'Новый член семьи'}
+              </h3>
+              <button onClick={() => setIsMemberModalOpen(false)} className="text-slate-500 hover:text-white">
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <form onSubmit={handleSaveMember} className="space-y-4">
+              <div>
+                <label className="block text-xs font-medium text-slate-400 mb-1">Имя / Член семьи *</label>
+                <input 
+                  type="text" 
+                  name="name" 
+                  defaultValue={editingMember?.name || ''} 
+                  required 
+                  placeholder="Александр"
+                  className="w-full px-3.5 py-2.5 bg-slate-950 border border-slate-800 rounded-xl text-xs text-slate-100 focus:outline-none focus:border-blue-500"
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs font-medium text-slate-400 mb-1">Статус / Роль</label>
+                <input 
+                  type="text" 
+                  name="role" 
+                  defaultValue={editingMember?.role || ''} 
+                  placeholder="Муж, Жена, Ребёнок"
+                  className="w-full px-3.5 py-2.5 bg-slate-950 border border-slate-800 rounded-xl text-xs text-slate-100 focus:outline-none focus:border-blue-500"
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs font-medium text-slate-400 mb-1">Цветовая тема</label>
+                <select 
+                  name="color" 
+                  defaultValue={editingMember?.color || 'from-blue-600 to-indigo-600'}
+                  className="w-full px-3 py-2 bg-slate-950 border border-slate-800 rounded-xl text-xs text-slate-100 focus:outline-none focus:border-blue-500"
+                >
+                  <option value="from-blue-600 to-indigo-600">Синий / Индиго</option>
+                  <option value="from-rose-500 to-pink-600">Розовый / Роза</option>
+                  <option value="from-emerald-500 to-teal-600">Изумрудный</option>
+                  <option value="from-amber-500 to-orange-600">Янтарный</option>
+                  <option value="from-purple-600 to-violet-600">Фиолетовый</option>
+                </select>
+              </div>
+
+              <div className="pt-2 flex justify-between items-center">
+                {editingMember ? (
+                  <button 
+                    type="button" 
+                    onClick={() => handleDeleteMember(editingMember.id)}
+                    className="text-xs text-rose-400 hover:text-rose-300 font-medium"
+                  >
+                    Удалить
+                  </button>
+                ) : <div />}
+
+                <div className="flex gap-2">
+                  <button 
+                    type="button" 
+                    onClick={() => setIsMemberModalOpen(false)}
+                    className="px-4 py-2 text-xs font-medium text-slate-400 hover:text-white"
+                  >
+                    Отмена
+                  </button>
+                  <button 
+                    type="submit" 
+                    className="px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white rounded-xl text-xs font-semibold shadow-md transition"
+                  >
+                    Сохранить
+                  </button>
+                </div>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* --- MODAL: DOCUMENT EDIT / CREATE --- */}
+      {isDocModalOpen && (
+        <div className="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="bg-slate-900 border border-slate-800 rounded-3xl w-full max-w-xl max-h-[90vh] flex flex-col overflow-hidden shadow-2xl">
+            
+            {/* Header */}
+            <div className="p-4 border-b border-slate-800 flex justify-between items-center">
+              <h3 className="font-bold text-slate-100 text-base">
+                {editingDoc ? 'Редактировать документ' : 'Новый документ'}
+              </h3>
+              <button onClick={() => setIsDocModalOpen(false)} className="text-slate-500 hover:text-white">
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            {/* Form */}
+            <form onSubmit={handleSaveDoc} className="flex-1 overflow-y-auto p-5 space-y-4">
+              
+              {/* Template Selector */}
+              <div>
+                <label className="block text-xs font-medium text-slate-400 mb-1">Тип документа *</label>
+                <select 
+                  name="doc_type"
+                  defaultValue={editingDoc?.type || 'passport_rf'}
+                  onChange={() => setEditingDoc(prev => prev ? {...prev, type: event.target.value} : null)}
+                  className="w-full px-3.5 py-2.5 bg-slate-950 border border-slate-800 rounded-xl text-xs text-slate-100 focus:outline-none focus:border-blue-500"
+                >
+                  {Object.entries(DOC_TEMPLATES).map(([key, tmpl]) => (
+                    <option key={key} value={key}>{tmpl.icon} {tmpl.name}</option>
+                  ))}
+                </select>
+              </div>
+
+              {/* Custom Title if 'custom' */}
+              {editingDoc?.type === 'custom' && (
+                <div>
+                  <label className="block text-xs font-medium text-slate-400 mb-1">Название документа *</label>
+                  <input 
+                    type="text" 
+                    name="custom_title"
+                    defaultValue={editingDoc?.customTitle || ''}
+                    placeholder="например, Свидетельство об имуществе"
+                    className="w-full px-3.5 py-2.5 bg-slate-950 border border-slate-800 rounded-xl text-xs text-slate-100 focus:outline-none focus:border-blue-500"
+                  />
+                </div>
+              )}
+
+              {/* Dynamic Fields */}
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3 pt-2 border-t border-slate-800/60">
+                {((DOC_TEMPLATES[editingDoc?.type || 'passport_rf'] || DOC_TEMPLATES.custom).fields).map(f => (
+                  <div key={f.id}>
+                    <label className="block text-xs font-medium text-slate-400 mb-1">{f.label}</label>
+                    <input 
+                      type={f.type || 'text'}
+                      name={`field_${f.id}`}
+                      defaultValue={editingDoc?.fields?.[f.id] || ''}
+                      placeholder={f.placeholder || ''}
+                      className="w-full px-3.5 py-2 bg-slate-950 border border-slate-800 rounded-xl text-xs text-slate-100 focus:outline-none focus:border-blue-500 font-mono"
+                    />
+                  </div>
+                ))}
+              </div>
+
+              {/* Scans & Crop Section */}
+              <div className="pt-3 border-t border-slate-800/60">
+                <div className="flex justify-between items-center mb-2">
+                  <label className="text-xs font-medium text-slate-400">Сканы и фотографии документа</label>
+                  <label className="cursor-pointer text-xs text-blue-400 hover:text-blue-300 font-medium flex items-center gap-1">
+                    <Camera className="w-3.5 h-3.5" /> Сделать фото / Обрезать
+                    <input type="file" accept="image/*" capture="environment" onChange={handleFileSelect} className="hidden" />
+                  </label>
+                </div>
+
+                {/* Scans preview grid */}
+                <div className="grid grid-cols-4 gap-2">
+                  {tempScans.map((scan, idx) => (
+                    <div key={scan.id || idx} className="relative group aspect-square rounded-xl overflow-hidden border border-slate-800 bg-slate-950">
+                      <img src={scan.data} alt="scan thumbnail" className="w-full h-full object-cover" />
+                      <button 
+                        type="button" 
+                        onClick={() => setTempScans(prev => prev.filter((_, i) => i !== idx))}
+                        className="absolute top-1 right-1 bg-rose-600 text-white p-1 rounded-full text-[10px] opacity-90 sm:opacity-0 group-hover:opacity-100 transition"
+                      >
+                        <X className="w-3 h-3" />
+                      </button>
+                    </div>
+                  ))}
+
+                  <label className="border-2 border-dashed border-slate-800 hover:border-blue-500/50 rounded-xl aspect-square flex flex-col items-center justify-center cursor-pointer text-slate-500 hover:text-blue-400 transition">
+                    <Plus className="w-5 h-5 mb-0.5" />
+                    <span className="text-[10px]">Добавить</span>
+                    <input type="file" accept="image/*" onChange={handleFileSelect} className="hidden" />
+                  </label>
+                </div>
+              </div>
+
+              {/* Expiry Settings */}
+              <div className="pt-3 border-t border-slate-800/60 grid grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-xs font-medium text-slate-400 mb-1">Срок действия до</label>
+                  <input 
+                    type="date" 
+                    name="expiry_date"
+                    defaultValue={editingDoc?.expiryDate || ''}
+                    className="w-full px-3 py-2 bg-slate-950 border border-slate-800 rounded-xl text-xs text-slate-100 focus:outline-none focus:border-blue-500"
+                  />
+                </div>
+                <div className="flex items-center pt-5">
+                  <label className="flex items-center gap-2 cursor-pointer text-xs text-slate-300">
+                    <input 
+                      type="checkbox" 
+                      name="has_expiry"
+                      defaultChecked={editingDoc?.hasExpiry || false}
+                      className="rounded border-slate-700 bg-slate-950 text-blue-600"
+                    />
+                    Отслеживать окончание
+                  </label>
+                </div>
+              </div>
+
+              {/* Footer */}
+              <div className="pt-4 border-t border-slate-800 flex justify-between items-center">
+                {editingDoc ? (
+                  <button 
+                    type="button" 
+                    onClick={() => handleDeleteDoc(editingDoc.id)}
+                    className="text-xs text-rose-400 hover:text-rose-300 font-medium flex items-center gap-1"
+                  >
+                    <Trash2 className="w-3.5 h-3.5" /> Удалить
+                  </button>
+                ) : <div />}
+
+                <div className="flex gap-2">
+                  <button 
+                    type="button" 
+                    onClick={() => setIsDocModalOpen(false)}
+                    className="px-4 py-2 text-xs font-medium text-slate-400 hover:text-white"
+                  >
+                    Отмена
+                  </button>
+                  <button 
+                    type="submit" 
+                    className="px-5 py-2 bg-blue-600 hover:bg-blue-500 text-white rounded-xl text-xs font-semibold shadow-md transition"
+                  >
+                    Сохранить
+                  </button>
+                </div>
+              </div>
+
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* --- MODAL: BACKUP EXPORT / IMPORT & CROSS-DEVICE --- */}
+      {isBackupModalOpen && (
+        <div className="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="bg-slate-900 border border-slate-800 rounded-3xl w-full max-w-md p-6 shadow-2xl space-y-5">
+            <div className="flex justify-between items-center">
+              <div className="flex items-center gap-2">
+                <Key className="w-5 h-5 text-blue-400" />
+                <h3 className="font-bold text-slate-100 text-base">Резервная копия и синхронизация</h3>
+              </div>
+              <button onClick={() => setIsBackupModalOpen(false)} className="text-slate-500 hover:text-white">
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <p className="text-xs text-slate-400 leading-relaxed">
+              Вы можете сохранить бэкап в зашифрованный JSON-файл и передать его на устройство супруга/супруги (через AirDrop, Bluetooth или флешку).
+            </p>
+
+            {/* Export Section */}
+            <div className="p-4 bg-slate-950/60 border border-slate-800 rounded-2xl space-y-3">
+              <h4 className="text-xs font-semibold text-slate-200 flex items-center gap-1.5">
+                <Download className="w-4 h-4 text-blue-400" /> Экспорт данных
+              </h4>
+              <input 
+                type="password" 
+                id="export-password"
+                placeholder="Пароль для шифрования бэкапа (необязательно)"
+                className="w-full px-3 py-2 bg-slate-900 border border-slate-800 rounded-xl text-xs text-slate-100 focus:outline-none focus:border-blue-500"
+              />
+              <button 
+                onClick={() => {
+                  const pass = document.getElementById('export-password').value;
+                  handleExportBackup(pass);
+                }}
+                className="w-full py-2 bg-blue-600 hover:bg-blue-500 text-white rounded-xl text-xs font-semibold shadow-md transition flex items-center justify-center gap-2"
+              >
+                Скачать резервную копию (.json)
+              </button>
+            </div>
+
+            {/* Import Section */}
+            <div className="p-4 bg-slate-950/60 border border-slate-800 rounded-2xl space-y-3">
+              <h4 className="text-xs font-semibold text-slate-200 flex items-center gap-1.5">
+                <Upload className="w-4 h-4 text-emerald-400" /> Импорт данных с другого устройства
+              </h4>
+              <input 
+                type="password" 
+                id="import-password"
+                placeholder="Пароль от зашифрованного бэкапа"
+                className="w-full px-3 py-2 bg-slate-900 border border-slate-800 rounded-xl text-xs text-slate-100 focus:outline-none focus:border-blue-500"
+              />
+              <label className="w-full py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-xl text-xs font-semibold transition flex items-center justify-center gap-2 cursor-pointer">
+                Выбрать файл бэкапа
+                <input 
+                  type="file" 
+                  accept=".json" 
+                  className="hidden" 
+                  onChange={(e) => {
+                    const file = e.target.files[0];
+                    const pass = document.getElementById('import-password').value;
+                    if (file) handleImportBackup(file, pass);
+                  }}
+                />
+              </label>
+            </div>
+          </div>
+        </div>
+      )}
+
+    </div>
+  );
+}
+
+// --- CROPPER & ENHANCEMENT CANVAS MODAL ---
+function CropperModal({ imageSrc, onCancel, onSave }) {
+  const canvasRef = useRef(null);
+  const [rotation, setRotation] = useState(0);
+  const [filterMode, setFilterMode] = useState('normal'); // 'normal', 'bw', 'contrast'
+  const [cropRect, setCropRect] = useState({ x: 10, y: 10, width: 80, height: 80 }); // percents
+
+  useEffect(() => {
+    renderCanvas();
+  }, [imageSrc, rotation, filterMode]);
+
+  const renderCanvas = () => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.src = imageSrc;
+    img.onload = () => {
+      // Calculate Rotated Bounds
+      if (rotation % 180 === 0) {
+        canvas.width = img.width;
+        canvas.height = img.height;
+      } else {
+        canvas.width = img.height;
+        canvas.height = img.width;
+      }
+
+      ctx.save();
+      ctx.translate(canvas.width / 2, canvas.height / 2);
+      ctx.rotate((rotation * Math.PI) / 180);
+      ctx.drawImage(img, -img.width / 2, -img.height / 2);
+      ctx.restore();
+
+      // Apply Filters
+      if (filterMode === 'bw' || filterMode === 'contrast') {
+        const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        const data = imgData.data;
+        for (let i = 0; i < data.length; i += 4) {
+          let avg = (data[i] + data[i + 1] + data[i + 2]) / 3;
+          if (filterMode === 'bw') {
+            // High Contrast B&W Threshold
+            avg = avg > 120 ? 255 : 0;
+            data[i] = avg;
+            data[i + 1] = avg;
+            data[i + 2] = avg;
+          } else if (filterMode === 'contrast') {
+            // Document Scan Contrast Enhancement
+            data[i] = Math.min(255, Math.max(0, (data[i] - 128) * 1.4 + 128));
+            data[i + 1] = Math.min(255, Math.max(0, (data[i + 1] - 128) * 1.4 + 128));
+            data[i + 2] = Math.min(255, Math.max(0, (data[i + 2] - 128) * 1.4 + 128));
+          }
+        }
+        ctx.putImageData(imgData, 0, 0);
+      }
+    };
+  };
+
+  const handleCropAndSave = () => {
+    const mainCanvas = canvasRef.current;
+    if (!mainCanvas) return;
+
+    // Crop area calculation
+    const cropX = (cropRect.x / 100) * mainCanvas.width;
+    const cropY = (cropRect.y / 100) * mainCanvas.height;
+    const cropW = (cropRect.width / 100) * mainCanvas.width;
+    const cropH = (cropRect.height / 100) * mainCanvas.height;
+
+    const cropCanvas = document.createElement('canvas');
+    cropCanvas.width = cropW;
+    cropCanvas.height = cropH;
+    const cropCtx = cropCanvas.getContext('2d');
+
+    cropCtx.drawImage(
+      mainCanvas,
+      cropX, cropY, cropW, cropH,
+      0, 0, cropW, cropH
+    );
+
+    onSave(cropCanvas.toDataURL('image/jpeg', 0.85));
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 bg-slate-950/90 backdrop-blur-md flex flex-col p-4">
+      {/* Top Header */}
+      <div className="flex justify-between items-center text-white mb-3">
+        <h3 className="text-sm font-bold flex items-center gap-2">
+          <Crop className="w-4 h-4 text-blue-400" /> Обрезка и обработка скана
+        </h3>
+        <button onClick={onCancel} className="p-1.5 text-slate-400 hover:text-white bg-slate-800 rounded-xl">
+          <X className="w-5 h-5" />
+        </button>
+      </div>
+
+      {/* Editor Main Canvas Container */}
+      <div className="flex-1 relative overflow-hidden bg-slate-900 border border-slate-800 rounded-2xl flex items-center justify-center p-2">
+        <canvas ref={canvasRef} className="max-h-full max-w-full object-contain rounded-lg shadow-lg" />
+
+        {/* Overlay Interactive Crop Box */}
+        <div 
+          className="absolute border-2 border-blue-500 bg-blue-500/10 pointer-events-none rounded-sm shadow-2xl"
+          style={{
+            left: `${cropRect.x}%`,
+            top: `${cropRect.y}%`,
+            width: `${cropRect.width}%`,
+            height: `${cropRect.height}%`,
+          }}
+        >
+          <div className="absolute top-0 left-0 w-3 h-3 border-t-2 border-l-2 border-white -mt-1 -ml-1"></div>
+          <div className="absolute top-0 right-0 w-3 h-3 border-t-2 border-r-2 border-white -mt-1 -mr-1"></div>
+          <div className="absolute bottom-0 left-0 w-3 h-3 border-b-2 border-l-2 border-white -mb-1 -ml-1"></div>
+          <div className="absolute bottom-0 right-0 w-3 h-3 border-b-2 border-r-2 border-white -mb-1 -mr-1"></div>
+        </div>
+      </div>
+
+      {/* Controls Bar */}
+      <div className="mt-3 bg-slate-900 border border-slate-800 p-3 rounded-2xl flex flex-col sm:flex-row justify-between items-center gap-3">
+        
+        {/* Filters and Rotations */}
+        <div className="flex items-center gap-2 overflow-x-auto w-full sm:w-auto">
+          <button 
+            type="button"
+            onClick={() => setRotation(r => (r + 90) % 360)}
+            className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-xl text-xs font-semibold flex items-center gap-1.5"
+          >
+            <RotateCw className="w-3.5 h-3.5" /> Поворот
+          </button>
+
+          <div className="h-4 w-px bg-slate-800 mx-1"></div>
+
+          <button 
+            type="button"
+            onClick={() => setFilterMode('normal')}
+            className={`px-3 py-1.5 rounded-xl text-xs font-semibold transition ${
+              filterMode === 'normal' ? 'bg-blue-600 text-white' : 'bg-slate-800 text-slate-400'
+            }`}
+          >
+            Оригинал
+          </button>
+          <button 
+            type="button"
+            onClick={() => setFilterMode('contrast')}
+            className={`px-3 py-1.5 rounded-xl text-xs font-semibold transition ${
+              filterMode === 'contrast' ? 'bg-blue-600 text-white' : 'bg-slate-800 text-slate-400'
+            }`}
+          >
+            Контраст
+          </button>
+          <button 
+            type="button"
+            onClick={() => setFilterMode('bw')}
+            className={`px-3 py-1.5 rounded-xl text-xs font-semibold transition ${
+              filterMode === 'bw' ? 'bg-blue-600 text-white' : 'bg-slate-800 text-slate-400'
+            }`}
+          >
+            Ч/Б Документ
+          </button>
+        </div>
+
+        {/* Action Buttons */}
+        <div className="flex gap-2 w-full sm:w-auto justify-end">
+          <button 
+            onClick={onCancel}
+            className="px-4 py-2 text-xs font-medium text-slate-400 hover:text-white"
+          >
+            Отмена
+          </button>
+          <button 
+            onClick={handleCropAndSave}
+            className="px-5 py-2 bg-blue-600 hover:bg-blue-500 text-white rounded-xl text-xs font-semibold shadow-md transition flex items-center gap-1.5"
+          >
+            <Check className="w-4 h-4" /> Сохранить скан
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
